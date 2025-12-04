@@ -41,7 +41,7 @@ def _get_sweep_files(config):
     files.sort()
     sweepfiles = []
     for file in files:
-        if 'sweep' in file.split('_')[0].lower():
+        if 'sweep' in file:
             sweepfiles.append(file)
     return sweepfiles
 
@@ -120,8 +120,9 @@ def _add_analysis_file(files):
 
 def _get_data_path(files, sweep=False):
     if sweep:
-        measurement_type = files[0].rstrip('.npy')
-        data_path = Path('data') / measurement_type
+        measurement_type = files[0].split('_')[0] + '_sweeps'
+        folder_name = files[0].rstrip('.npy')
+        data_path = Path('data') / measurement_type / folder_name
         return data_path
     measurement_type = files[0].split('_')[0]
     data_path = Path('data') / measurement_type
@@ -146,16 +147,17 @@ def _write_lab_log_if_configured(config, imagefiles, files, sweep=False):
         date = datetime.today().strftime('%Y-%m-%d')
         measurement_type = files[0].split('_')[0]
         if sweep:
-            measurement_type = files[0].rstrip('.npy')
-        with open(Path('data') / f'log_{date}.md', 'a',
+            measurement_type = files[0].split('_')[0] + '_sweeps'
+            folder_name = files[0].rstrip('.npy')
+        with open(Path('data')/'LabLog'/ f'log_{date}.md', 'a',
                   encoding='utf-8') as file:
             file.write(
                 '## ' + files[0].rstrip(config['file_type'] + '\n\n'))
             # file.write(data_message + '\n')
             for image in imagefiles:
-                file.write(f'![]({measurement_type}/{image})\n')
+                file.write(f'![](../{measurement_type}/{folder_name}/{image})\n')
             file.write(
-                f'[config]({measurement_type}/{files[0].replace(config["file_type"], ".yaml")})\n')
+                f'[config](../{measurement_type}/{folder_name}/{files[0].replace(config["file_type"], ".yaml")})\n')
             file.write(data_message + '\n')
 
 
@@ -177,7 +179,7 @@ def move_sweep():
     files_to_move.extend(_get_sweep_files(config))
     _add_yaml_if_configured(config, files_to_move)
     image_files = _get_images_if_configured(config)
-    _add_analysis_file(files_to_move)
+    #_add_analysis_file(files_to_move)
     _move_files(files_to_move, sweep=True)
     image_files = move_images(
         image_files, files_to_move[0], config, sweep=True)
