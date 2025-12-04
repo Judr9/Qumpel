@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+setup.py
+manager/__init__.py
+manager/main.py
+manager/meta_data.py
+manager/move_files.py
+manager/new_folder_setup.py
+pylab_manager.egg-info/PKG-INFO
+pylab_manager.egg-info/SOURCES.txt
+pylab_manager.egg-info/dependency_links.txt
+pylab_manager.egg-info/entry_points.txt
+pylab_manager.egg-info/requires.txt
+pylab_manager.egg-info/top_level.txt
