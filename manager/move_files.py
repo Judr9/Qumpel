@@ -43,6 +43,8 @@ def _get_sweep_files(config):
     for file in files:
         if 'sweep' in file:
             sweepfiles.append(file)
+    if sweepfiles == []:
+        raise FileNotFoundError("No measurement sweep files found to copy.")
     return sweepfiles
 
 
@@ -74,6 +76,12 @@ def _get_images_if_configured(config):
 
 
 def move_images(images, basefile, config, sweep=False):
+    if config['save_obsidian']:
+        data_path = Path(config['path_obsidian_files'])
+        _ensure_target_path_exists(data_path)
+        for image in images:
+            copy(image, data_path / image)
+
     data_path = _get_data_path([basefile], sweep)
     _ensure_target_path_exists(data_path)
     if config['prepend_filename']:
@@ -86,6 +94,8 @@ def move_images(images, basefile, config, sweep=False):
         return new_images
     for image in images:
         move(image, data_path / image)
+
+
     return images
 
 
@@ -159,6 +169,25 @@ def _write_lab_log_if_configured(config, imagefiles, files, sweep=False):
             file.write(
                 f'[config](../{measurement_type}/{folder_name}/{files[0].replace(config["file_type"], ".yaml")})\n')
             file.write(data_message + '\n')
+
+    if config['save_obsidian']:
+        date = datetime.today().strftime('%Y-%m-%d')
+        base = Path(config['path_obsidian_lablog'])
+        today = datetime.today()
+        year = today.strftime("%Y")
+        month_folder = today.strftime("%m-%B")  # e.g. "07-July"
+        date_file = today.strftime("%Y-%m-%d-%A")  # e.g. "2025-07-07-Monday"
+
+        path_to_file = base / year / month_folder
+        print(path_to_file)
+
+        with open(path_to_file / f'{date_file}.md', 'a', encoding='utf-8') as file:
+            file.write('\n#### ' + files[0].rstrip(config['file_type'] + '\n'))
+            for image in imagefiles:
+                file.write(f'![[{image}]]\n')
+            file.write(data_message + '\n')
+
+
 
 
 def move_data():
