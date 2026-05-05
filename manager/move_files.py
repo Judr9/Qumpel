@@ -4,7 +4,20 @@ import os
 import sys
 from shutil import move, copy
 from datetime import datetime
+import re
 import yaml
+from collections import defaultdict
+
+
+TIME_TAG_PATTERNS = (
+    re.compile(r"\d{8}_\d{6}"),
+    re.compile(r"\d{4}-\d{2}-\d{2}[_-]\d{2}-\d{2}-\d{2}"),
+)
+SWEEP_SPLIT_PATTERN = re.compile(r"_sweep_", re.IGNORECASE)
+NUMERIC_TOKEN_PATTERN = re.compile(r"^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$")
+TOKEN_WITH_TRAILING_NUMERIC_PATTERN = re.compile(
+    r"^(?P<prefix>[A-Za-z_][A-Za-z0-9_]*?)(?P<value>[+-]?\d.*)$"
+)
 
 
 def get_manager_config():
@@ -41,7 +54,7 @@ def _get_sweep_files(config):
     files.sort()
     sweepfiles = []
     for file in files:
-        if 'sweep' in file:
+        if 'sweep' in file or "_ch-" in file:
             sweepfiles.append(file)
     if sweepfiles == []:
         raise FileNotFoundError("No measurement sweep files found to copy.")
@@ -64,7 +77,30 @@ def _add_yaml_if_configured(config, files):
     if config['track_yaml']:
         original_files = files.copy()
         for file in original_files:
-            files.append(file.replace(config['file_type'], '.yaml'))
+            yaml_file = file.replace(config['file_type'], '.yaml')
+            if Path(yaml_file).exists():
+                files.append(yaml_file)
+
+
+def _add_channel_companion_files(files):
+    channel_files = [file for file in files if "_ch-" in Path(file).name]
+    if not channel_files:
+        return
+
+    channel_tags = set()
+    for file in channel_files:
+        channel_tags.update(_extract_time_tags(file))
+
+    if not channel_tags:
+        return
+
+    candidates = glob("*.npy") + glob("*.yaml")
+    for candidate in candidates:
+        if candidate in files:
+            continue
+        candidate_tags = _extract_time_tags(candidate)
+        if channel_tags.intersection(candidate_tags):
+            files.append(candidate)
 
 
 def _get_images_if_configured(config):
@@ -73,6 +109,93 @@ def _get_images_if_configured(config):
     else:
         images = []
     return images
+
+
+def _extract_time_tags(filename):
+    stem = Path(filename).stem
+    tags = set()
+    for pattern in TIME_TAG_PATTERNS:
+        tags.update(pattern.findall(stem))
+    return tags
+
+
+def _filter_images_by_time_tag(images, measurement_files):
+    measurement_tags = set()
+    for measurement_file in measurement_files:
+        measurement_tags.update(_extract_time_tags(measurement_file))
+
+    if not measurement_tags:
+        return []
+
+    matching_images = []
+    for image in images:
+        image_tags = _extract_time_tags(image)
+        if measurement_tags.intersection(image_tags):
+            matching_images.append(image)
+    return matching_images
+
+
+def _select_files_with_same_time_tag(files):
+    if not files:
+        return []
+    if len(files) == 1:
+        return files
+
+    selected_file = files[file_selector(files)]
+    selected_tags = _extract_time_tags(selected_file)
+    if not selected_tags:
+        return [selected_file]
+
+    matching_files = []
+    for file in files:
+        if selected_tags.intersection(_extract_time_tags(file)):
+            matching_files.append(file)
+    return matching_files
+
+
+def _extract_sweep_parameter_key(filename):
+    stem = Path(filename).stem
+    split = SWEEP_SPLIT_PATTERN.split(stem, maxsplit=1)
+    if len(split) < 2:
+        return None
+
+    sweep_part = split[1]
+    for pattern in TIME_TAG_PATTERNS:
+        sweep_part = pattern.sub("", sweep_part)
+    sweep_part = sweep_part.strip("_-")
+    if not sweep_part:
+        return None
+
+    tokens = [token for token in sweep_part.split("_") if token]
+    if not tokens:
+        return None
+
+    last_token = tokens[-1]
+    trailing_numeric_match = TOKEN_WITH_TRAILING_NUMERIC_PATTERN.match(last_token)
+    if trailing_numeric_match:
+        prefix = trailing_numeric_match.group("prefix")
+        key_tokens = tokens[:-1] + [prefix]
+    elif NUMERIC_TOKEN_PATTERN.match(last_token):
+        key_tokens = tokens[:-1]
+    else:
+        key_tokens = tokens
+
+    key_tokens = [token for token in key_tokens if token]
+    if not key_tokens:
+        return None
+    return "_".join(key_tokens)
+
+
+def _group_sweep_files_by_parameter(files):
+    groups = defaultdict(list)
+    for file in files:
+        key = _extract_sweep_parameter_key(file)
+        if key is None:
+            key = "__unknown_parameter__"
+        groups[key].append(file)
+    for key in groups:
+        groups[key].sort()
+    return groups
 
 
 def move_images(images, basefile, config, sweep=False):
@@ -151,14 +274,18 @@ def _move_files(files, sweep=False):
         move(file, data_path / file)
 
 
-def _write_lab_log_if_configured(config, imagefiles, files, sweep=False):
+def _write_lab_log_if_configured(
+        config, imagefiles, files, sweep=False, include_comments=True,
+        data_message=None):
+    comment_text = data_message if data_message is not None else ''
     if config['keep_lab_log']:
-        data_message = input('Please enter a comment about this measurement: ')
+        if include_comments and data_message is None:
+            comment_text = input('Please enter a comment about this measurement: ')
         date = datetime.today().strftime('%Y-%m-%d')
         measurement_type = files[0].split('_')[0]
         if sweep:
             measurement_type = files[0].split('_')[0] + '_sweeps'
-            folder_name = files[0].rstrip('.npy')
+        folder_name = files[0].rstrip('.npy')
         with open(Path('data')/'LabLog'/ f'log_{date}.md', 'a',
                   encoding='utf-8') as file:
             file.write(
@@ -168,7 +295,8 @@ def _write_lab_log_if_configured(config, imagefiles, files, sweep=False):
                 file.write(f'![](../{measurement_type}/{folder_name}/{image})\n')
             file.write(
                 f'[config](../{measurement_type}/{folder_name}/{files[0].replace(config["file_type"], ".yaml")})\n')
-            file.write(data_message + '\n')
+            if comment_text:
+                file.write(comment_text + '\n')
 
     if config['save_obsidian']:
         date = datetime.today().strftime('%Y-%m-%d')
@@ -185,32 +313,40 @@ def _write_lab_log_if_configured(config, imagefiles, files, sweep=False):
             file.write('\n#### ' + files[0].rstrip(config['file_type'] + '\n'))
             for image in imagefiles:
                 file.write(f'![[{image}]]\n')
-            file.write(data_message + '\n')
+            if comment_text:
+                file.write(comment_text + '\n')
 
 
 
 
-def move_data():
+def move_data(include_comments=True):
     config = get_manager_config()
     files_to_move = []
     files_to_move.append(get_current_measurement_file(config))
     _add_yaml_if_configured(config, files_to_move)
     image_files = _get_images_if_configured(config)
+    image_files = _filter_images_by_time_tag(image_files, files_to_move)
     _add_analysis_file(files_to_move)
+    _write_lab_log_if_configured(
+        config, image_files, files_to_move, include_comments=include_comments)
     _move_files(files_to_move)
     image_files = move_images(image_files, files_to_move[0], config)
-    _write_lab_log_if_configured(config, image_files, files_to_move)
 
 
-def move_sweep():
+def move_sweep(include_comments=True):
     config = get_manager_config()
-    files_to_move = []
-    files_to_move.extend(_get_sweep_files(config))
+    files_to_move = _get_sweep_files(config)
     _add_yaml_if_configured(config, files_to_move)
+    _add_channel_companion_files(files_to_move)
     image_files = _get_images_if_configured(config)
+    image_files = _filter_images_by_time_tag(image_files, files_to_move)
+    shared_comment = None
+    if config['keep_lab_log'] and include_comments:
+        shared_comment = input('Please enter a comment about this measurement: ')
     #_add_analysis_file(files_to_move)
+    _write_lab_log_if_configured(
+        config, image_files, files_to_move, sweep=True,
+        include_comments=False, data_message=shared_comment)
     _move_files(files_to_move, sweep=True)
     image_files = move_images(
         image_files, files_to_move[0], config, sweep=True)
-    _write_lab_log_if_configured(
-        config, image_files, files_to_move, sweep=True)
