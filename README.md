@@ -49,9 +49,34 @@ Invalid bounds or a `data_after` later than `data_before` raise `ValueError`
 before any files are moved. Existing compact (`20261007_160232`) and underscore
 (`2026-10-07_16-02-32`) timestamps remain supported.
 
+`move_sweep` accepts measurement filenames containing `sweep`, `_ch-`, or
+`timetrace` (including `_timetrace_`). Timetraces use the same filters,
+selection prompts, related-file handling, and sweep destination folders.
+`_sweep_` and `_timetrace_` identify separate variants, even when the experiment
+prefix and parameter match.
+
 `move_sweep` first applies the supplied filters, then groups files by their
 experiment prefix and sweep parameter. Values such as `mw_duration0.25` and
 `mw_duration1.5` belong to the same variant, including their channel files.
+
+Grid sweeps are grouped by all parameter names in filename order, ignoring
+every numeric sweep value. For example, these measurements belong to one
+variant, `CASR_sensitivity_sweep_pi_pi_half`:
+
+```text
+CASR_sensitivity_sweep_pi0.0285_pi_half0.0143_2026-10-19-19-54-49
+CASR_sensitivity_sweep_pi0.028_pi_half0.014_2026-10-19-19-54-05
+```
+
+All their channel measurements (such as `ch-0` and `ch-2`), matching YAML
+files, and figures move into the same folder. Measurement filenames keep their
+original parameter values.
+Integer, decimal, signed, and scientific notation values are supported, either
+attached to parameter names or separated by underscores. Hardware channel
+identifiers such as `Ch1` in `AWG_Ch1_freq` are preserved. Different parameter
+combinations remain separate variants, and the timestamp-gap check below still
+applies to separate measurement sessions. This also works for `_timetrace_` files.
+
 If there are multiple variants, you choose one by entering its number:
 
 ```text

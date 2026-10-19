@@ -15,11 +15,13 @@ TIME_TAG_PATTERNS = (
     re.compile(r"\d{4}-\d{2}-\d{2}[_-]\d{2}-\d{2}-\d{2}"),
 )
 TIME_FILTER_FORMAT = '%Y-%m-%d-%H-%M-%S'
-SWEEP_SPLIT_PATTERN = re.compile(r"_sweep_", re.IGNORECASE)
-NUMERIC_TOKEN_PATTERN = re.compile(r"^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$")
+SWEEP_SPLIT_PATTERN = re.compile(r"_(?:sweep|timetrace)_", re.IGNORECASE)
+NUMERIC_VALUE_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+NUMERIC_TOKEN_PATTERN = re.compile(rf"^{NUMERIC_VALUE_PATTERN}$")
 TOKEN_WITH_TRAILING_NUMERIC_PATTERN = re.compile(
-    r"^(?P<prefix>[A-Za-z_][A-Za-z0-9_]*?)(?P<value>[+-]?\d.*)$"
+    rf"^(?P<prefix>[A-Za-z_][A-Za-z0-9_]*?)(?P<value>{NUMERIC_VALUE_PATTERN})$"
 )
+CHANNEL_IDENTIFIER_PATTERN = re.compile(r"(?:ch|channel)\d+", re.IGNORECASE)
 MANUAL_TIME_RANGE_PATTERN = re.compile(
     r"^\s*(\d{4}(?:-\d{2}){5})\s+-\s+(\d{4}(?:-\d{2}){5})\s*$"
 )
@@ -125,7 +127,7 @@ def _get_sweep_files(
     files.sort()
     sweepfiles = []
     for file in files:
-        if 'sweep' in file or "_ch-" in file:
+        if 'sweep' in file or "_ch-" in file or 'timetrace' in file:
             sweepfiles.append(file)
     if sweepfiles == []:
         raise FileNotFoundError("No measurement sweep files found to copy.")
@@ -174,7 +176,8 @@ def _add_channel_companion_files(
         if candidate in files:
             continue
         if (sweep_variant is not None
-                and ('sweep' in candidate or '_ch-' in candidate)
+                and ('sweep' in candidate or '_ch-' in candidate
+                     or 'timetrace' in candidate)
                 and _extract_sweep_variant_key(candidate) != sweep_variant):
             continue
         candidate_tags = _extract_time_tags(candidate)
@@ -246,6 +249,7 @@ def _strip_sweep_metadata(filename):
 
 
 def _extract_sweep_parameter_key(filename):
+    """Group by parameter names, removing every numeric value in a grid sweep."""
     stem = _strip_sweep_metadata(filename)
     split = SWEEP_SPLIT_PATTERN.split(stem, maxsplit=1)
     if len(split) < 2:
@@ -260,17 +264,18 @@ def _extract_sweep_parameter_key(filename):
     if not tokens:
         return None
 
-    last_token = tokens[-1]
-    trailing_numeric_match = TOKEN_WITH_TRAILING_NUMERIC_PATTERN.match(last_token)
-    if trailing_numeric_match:
-        prefix = trailing_numeric_match.group("prefix")
-        key_tokens = tokens[:-1] + [prefix]
-    elif NUMERIC_TOKEN_PATTERN.match(last_token):
-        key_tokens = tokens[:-1]
-    else:
-        key_tokens = tokens
+    key_tokens = []
+    for token in tokens:
+        if NUMERIC_TOKEN_PATTERN.fullmatch(token):
+            continue
+        # Ch1 in AWG_Ch1_freq names hardware rather than a swept value.
+        if CHANNEL_IDENTIFIER_PATTERN.fullmatch(token):
+            key_tokens.append(token)
+            continue
+        trailing_numeric_match = TOKEN_WITH_TRAILING_NUMERIC_PATTERN.fullmatch(token)
+        key_tokens.append(
+            trailing_numeric_match.group('prefix') if trailing_numeric_match else token)
 
-    key_tokens = [token for token in key_tokens if token]
     if not key_tokens:
         return None
     return "_".join(key_tokens)
@@ -281,8 +286,8 @@ def _extract_sweep_variant_key(filename):
     parameter = _extract_sweep_parameter_key(filename)
     if parameter is None:
         return stem
-    experiment = SWEEP_SPLIT_PATTERN.split(stem, maxsplit=1)[0]
-    return experiment + '_sweep_' + parameter
+    marker = SWEEP_SPLIT_PATTERN.search(stem)
+    return stem[:marker.start()] + marker.group().lower() + parameter
 
 
 def _group_sweep_files_by_parameter(files):
@@ -526,7 +531,7 @@ def move_data(
 def move_sweep(
         include_comments=True, experiment_type=None, sweep_param=None,
         data_before=None, data_after=None, sweep_gap_factor=2):
-    """Select a sweep variant and time range, then move its related files."""
+    """Select a sweep or timetrace variant and time range, then move related files."""
     config = get_manager_config()
     files_to_move = _get_sweep_files(
         config, experiment_type, sweep_param,
