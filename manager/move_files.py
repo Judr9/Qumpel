@@ -212,9 +212,14 @@ def _filter_images_by_time_tag(images, measurement_files, sweep_variant=None):
     matching_images = []
     for image in images:
         if (sweep_variant is not None
-                and SWEEP_SPLIT_PATTERN.search(Path(image).stem)
-                and _extract_sweep_variant_key(image) != sweep_variant):
-            continue
+                and SWEEP_SPLIT_PATTERN.search(Path(image).stem)):
+            image_variant = _extract_sweep_variant_key(image)
+            # Plot labels can prepend an extra "sweep_" to the parameter name.
+            plot_variant = re.sub(
+                r'(_sweep_)sweep_', r'\1', image_variant,
+                count=1, flags=re.IGNORECASE)
+            if sweep_variant not in (image_variant, plot_variant):
+                continue
         image_tags = _extract_time_tags(image)
         if measurement_tags.intersection(image_tags):
             matching_images.append(image)

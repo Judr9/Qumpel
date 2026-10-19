@@ -109,6 +109,10 @@ YAML files, channel companions, figures, and lab-log entries follow the selected
 variant and timestamps. Figures explicitly named for another sweep variant are
 excluded even if they share a timestamp; generic figures follow timestamp
 matching as before.
+Plot labels may repeat `sweep_`: for example,
+`CASR_sensitivity_sweep_sweep_N_2026-10-19-21-19-12_combined.png` also matches
+measurements grouped as `CASR_sensitivity_sweep_N` at that timestamp. Suffixes
+after the timestamp, including `_combined`, do not affect matching.
 
 To adjust how large an increase suggests a new sweep, set `sweep_gap_factor`
 (a finite number greater than 1, default 2):
