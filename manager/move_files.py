@@ -8,6 +8,9 @@ from math import isfinite
 import re
 import yaml
 from collections import defaultdict
+from dataclasses import dataclass
+import errno
+import json
 
 
 TIME_TAG_PATTERNS = (
@@ -18,10 +21,16 @@ TIME_FILTER_FORMAT = '%Y-%m-%d-%H-%M-%S'
 SWEEP_SPLIT_PATTERN = re.compile(r"_(?:sweep|timetrace)_", re.IGNORECASE)
 NUMERIC_VALUE_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 NUMERIC_TOKEN_PATTERN = re.compile(rf"^{NUMERIC_VALUE_PATTERN}$")
+INDEXED_NUMERIC_TOKEN_PATTERN = re.compile(
+    rf"^\d+(?=[+-]){NUMERIC_VALUE_PATTERN}$")
 TOKEN_WITH_TRAILING_NUMERIC_PATTERN = re.compile(
     rf"^(?P<prefix>[A-Za-z_][A-Za-z0-9_]*?)(?P<value>{NUMERIC_VALUE_PATTERN})$"
 )
 CHANNEL_IDENTIFIER_PATTERN = re.compile(r"(?:ch|channel)\d+", re.IGNORECASE)
+WINDOWS_PATH_LIMIT = 259
+WINDOWS_DIRECTORY_LIMIT = 247
+WINDOWS_COMPONENT_LIMIT = 255
+FILENAME_MAP = 'filename_map.json'
 MANUAL_TIME_RANGE_PATTERN = re.compile(
     r"^\s*(\d{4}(?:-\d{2}){5})\s+-\s+(\d{4}(?:-\d{2}){5})\s*$"
 )
@@ -151,7 +160,7 @@ def _add_yaml_if_configured(config, files):
         original_files = files.copy()
         for file in original_files:
             yaml_file = file.replace(config['file_type'], '.yaml')
-            if Path(yaml_file).exists():
+            if Path(_io_path(yaml_file)).exists():
                 files.append(yaml_file)
 
 
@@ -201,7 +210,8 @@ def _extract_time_tags(filename):
     return tags
 
 
-def _filter_images_by_time_tag(images, measurement_files, sweep_variant=None):
+def _filter_images_by_time_tag(images, measurement_files):
+    """Include every image sharing a filename timestamp with a selected measurement."""
     measurement_tags = set()
     for measurement_file in measurement_files:
         measurement_tags.update(_extract_time_tags(measurement_file))
@@ -211,15 +221,6 @@ def _filter_images_by_time_tag(images, measurement_files, sweep_variant=None):
 
     matching_images = []
     for image in images:
-        if (sweep_variant is not None
-                and SWEEP_SPLIT_PATTERN.search(Path(image).stem)):
-            image_variant = _extract_sweep_variant_key(image)
-            # Plot labels can prepend an extra "sweep_" to the parameter name.
-            plot_variant = re.sub(
-                r'(_sweep_)sweep_', r'\1', image_variant,
-                count=1, flags=re.IGNORECASE)
-            if sweep_variant not in (image_variant, plot_variant):
-                continue
         image_tags = _extract_time_tags(image)
         if measurement_tags.intersection(image_tags):
             matching_images.append(image)
@@ -253,37 +254,55 @@ def _strip_sweep_metadata(filename):
     return re.sub(r'_ch-[^_]+', '', stem).strip('_-')
 
 
-def _extract_sweep_parameter_key(filename):
-    """Group by parameter names, removing every numeric value in a grid sweep."""
+def _extract_sweep_parameters(filename):
+    """Return parameter names and original value text, including indexed values."""
     stem = _strip_sweep_metadata(filename)
     split = SWEEP_SPLIT_PATTERN.split(stem, maxsplit=1)
     if len(split) < 2:
-        return None
+        return []
 
     sweep_part = split[1]
     sweep_part = sweep_part.strip("_-")
     if not sweep_part:
-        return None
+        return []
 
     tokens = [token for token in sweep_part.split("_") if token]
     if not tokens:
-        return None
+        return []
 
-    key_tokens = []
+    parameters = []
+    name_tokens = []
     for token in tokens:
-        if NUMERIC_TOKEN_PATTERN.fullmatch(token):
+        if (NUMERIC_TOKEN_PATTERN.fullmatch(token)
+                or INDEXED_NUMERIC_TOKEN_PATTERN.fullmatch(token)):
+            if name_tokens:
+                parameters.append(('_'.join(name_tokens), '_' + token))
+                name_tokens = []
+            elif parameters:
+                name, value = parameters[-1]
+                parameters[-1] = (name, value + '_' + token)
             continue
         # Ch1 in AWG_Ch1_freq names hardware rather than a swept value.
         if CHANNEL_IDENTIFIER_PATTERN.fullmatch(token):
-            key_tokens.append(token)
+            name_tokens.append(token)
             continue
         trailing_numeric_match = TOKEN_WITH_TRAILING_NUMERIC_PATTERN.fullmatch(token)
-        key_tokens.append(
-            trailing_numeric_match.group('prefix') if trailing_numeric_match else token)
+        if trailing_numeric_match:
+            name_tokens.append(trailing_numeric_match.group('prefix'))
+            parameters.append((
+                '_'.join(name_tokens), trailing_numeric_match.group('value')))
+            name_tokens = []
+        else:
+            name_tokens.append(token)
+    if name_tokens:
+        parameters.append(('_'.join(name_tokens), ''))
+    return parameters
 
-    if not key_tokens:
-        return None
-    return "_".join(key_tokens)
+
+def _extract_sweep_parameter_key(filename):
+    """Group grids of any dimension by names, ignoring all numeric value text."""
+    parameters = _extract_sweep_parameters(filename)
+    return '_'.join(name for name, _ in parameters) if parameters else None
 
 
 def _extract_sweep_variant_key(filename):
@@ -394,15 +413,166 @@ def _select_sweep_time_range(files, sweep_gap_factor):
         print('Your choice was invalid, please try again!')
 
 
-def move_images(images, basefile, config, sweep=False):
+@dataclass
+class _TransferPlan:
+    data_path: Path
+    file_names: dict[str, str]
+    image_names: dict[str, str]
+    obsidian_names: dict[str, str]
+    shortening: int = 0
+
+
+def _windows_length(value):
+    return len(str(value).encode('utf-16-le')) // 2
+
+
+def _fits_windows_path(path, directory=False):
+    path = Path(path).absolute()
+    limit = min(WINDOWS_PATH_LIMIT, WINDOWS_DIRECTORY_LIMIT) if directory else WINDOWS_PATH_LIMIT
+    return (_windows_length(path) <= limit
+            and all(_windows_length(part) <= WINDOWS_COMPONENT_LIMIT for part in path.parts))
+
+
+def _parameter_initials(name):
+    return ''.join(
+        token[0] + (''.join(re.findall(r'\d+', token))
+                    if CHANNEL_IDENTIFIER_PATTERN.fullmatch(token) else '')
+        for token in name.split('_') if token)
+
+
+def _shorten_filename(filename, level):
+    path = Path(filename)
+    stem = path.stem
+    clean_stem = _strip_sweep_metadata(filename)
+    marker = SWEEP_SPLIT_PATTERN.search(clean_stem)
+    if marker:
+        parameters = _extract_sweep_parameters(filename)
+        if level == 2:
+            parameters = parameters[:1]
+        label = clean_stem[:marker.end()] + '_'.join(
+            _parameter_initials(name) + value for name, value in parameters)
+    else:
+        label = _parameter_initials(clean_stem) or 'file'
+    channels = re.findall(r'(?:^|_)(ch-[^_]+)', stem)
+    matches = sorted(
+        (match.start(), match.group())
+        for pattern in TIME_TAG_PATTERNS for match in pattern.finditer(stem))
+    timestamps = list(dict.fromkeys(tag for _, tag in matches))
+    trailing_label = ''
+    if matches:
+        start, tag = matches[0]
+        trailing = stem[start + len(tag):]
+        for timestamp in timestamps:
+            trailing = trailing.replace(timestamp, '')
+        trailing = re.sub(r'(?:^|_)ch-[^_]+', '', trailing)
+        trailing_label = _parameter_initials(trailing.strip('_-'))
+    parts = [label.strip('_-'), *dict.fromkeys(channels), *timestamps, trailing_label]
+    return '_'.join(part for part in parts if part) + path.suffix
+
+
+def _transfer_targets(plan, config):
+    targets = [plan.data_path / name for name in plan.file_names.values()]
+    targets.extend(plan.data_path / name for name in plan.image_names.values())
+    if plan.obsidian_names:
+        targets.extend(Path(config['path_obsidian_files']) / name
+                       for name in plan.obsidian_names.values())
+    if plan.shortening:
+        targets.append(plan.data_path / FILENAME_MAP)
+    return targets
+
+
+def _prepare_transfer(files, images, config, sweep=False):
+    original_path = _get_data_path(files, sweep)
+    base_stem = Path(files[0]).stem
+    original_images = {
+        image: base_stem + '_' + image if config['prepend_filename'] else image
+        for image in images}
+    for level in range(3):
+        names = {file: _shorten_filename(file, level) if level else file for file in files}
+        image_names = {
+            image: _shorten_filename(name, level) if level else name
+            for image, name in original_images.items()}
+        obsidian_names = {
+            image: _shorten_filename(image, level) if level else image
+            for image in images} if config['save_obsidian'] else {}
+        data_path = (original_path.parent / Path(names[files[0]]).stem
+                     if sweep and level else original_path)
+        plan = _TransferPlan(data_path, names, image_names, obsidian_names, level)
+        targets = _transfer_targets(plan, config)
+        directories = {data_path, *(path.parent for path in targets)}
+        if (all(_fits_windows_path(path, directory=True) for path in directories)
+                and all(_fits_windows_path(path) for path in targets)):
+            seen = set()
+            for target in targets:
+                key = str(target.absolute()).casefold()
+                if key in seen or target.exists():
+                    raise FileExistsError(f'Refusing to overwrite destination: {target}')
+                seen.add(key)
+            return plan
+    raise OSError(
+        errno.ENAMETOOLONG,
+        'Destination paths are still too long after shortening parameter names and '
+        'keeping only the first parameter. No measurement files were moved. '
+        'Use a measurement folder (or Obsidian destination) closer to the drive root.')
+
+
+def _io_path(path):
+    """Allow reading existing long Windows source paths without changing their names."""
+    absolute = str(Path(path).absolute())
+    if os.name == 'nt' and _windows_length(absolute) > 259 and not absolute.startswith('\\\\?\\'):
+        return ('\\\\?\\UNC\\' + absolute[2:] if absolute.startswith('\\\\')
+                else '\\\\?\\' + absolute)
+    return str(path)
+
+
+def _transfer_batch(files, images, config, sweep=False, include_comments=True, data_message=None):
+    plan = _prepare_transfer(files, images, config, sweep)
+    if config['keep_lab_log'] and include_comments and data_message is None:
+        data_message = input('Please enter a comment about this measurement: ')
+        include_comments = False
+    if plan.shortening:
+        _ensure_target_path_exists(plan.data_path)
+        mapping = {
+            'shortening': ('parameter initials' if plan.shortening == 1
+                           else 'first parameter only'),
+            'original_folder': str(_get_data_path(files, sweep)),
+            'destination_folder': str(plan.data_path),
+            'files': plan.file_names,
+            'images': plan.image_names,
+            'obsidian_images': plan.obsidian_names,
+        }
+        with (plan.data_path / FILENAME_MAP).open('x', encoding='utf-8') as file:
+            json.dump(mapping, file, indent=2, ensure_ascii=False)
+    _write_lab_log_if_configured(
+        config, list(plan.image_names.values()), list(plan.file_names.values()),
+        sweep=sweep, include_comments=include_comments, data_message=data_message,
+        data_path=plan.data_path, obsidian_imagefiles=list(plan.obsidian_names.values()))
+    _move_files(files, sweep, data_path=plan.data_path, filenames=plan.file_names)
+    move_images(images, files[0], config, sweep, plan=plan)
+    if plan.shortening:
+        style = ('parameter names -> initials (readout_phase -> rp); values retained'
+                 if plan.shortening == 1 else
+                 'parameter names -> initials; only the first sweep parameter retained')
+        print(f'\nShortened this batch for Windows path limits '
+              f'({len(files)} files, {len(images)} images): {style}.\n'
+              'Timestamps, channels, and extensions retained.\n'
+              f'Original names and destinations: {plan.data_path / FILENAME_MAP}')
+
+
+def move_images(images, basefile, config, sweep=False, plan=None):
     if config['save_obsidian']:
         data_path = Path(config['path_obsidian_files'])
         _ensure_target_path_exists(data_path)
         for image in images:
-            copy(image, data_path / image)
+            name = plan.obsidian_names[image] if plan else image
+            copy(_io_path(image), data_path / name)
 
-    data_path = _get_data_path([basefile], sweep)
+    data_path = plan.data_path if plan else _get_data_path([basefile], sweep)
     _ensure_target_path_exists(data_path)
+    if plan:
+        for image, name in plan.image_names.items():
+            move(_io_path(image), data_path / name)
+        return list(plan.image_names.values())
     if config['prepend_filename']:
         basename = basefile.rstrip(config['file_type'])
         new_images = []
@@ -450,7 +620,7 @@ def _add_analysis_file(files):
 def _get_data_path(files, sweep=False):
     if sweep:
         measurement_type = files[0].split('_')[0] + '_sweeps'
-        folder_name = files[0].rstrip('.npy')
+        folder_name = Path(files[0]).stem
         data_path = Path('data') / measurement_type / folder_name
         return data_path
     measurement_type = files[0].split('_')[0]
@@ -463,34 +633,32 @@ def _ensure_target_path_exists(path):
         path.mkdir(parents=True)
 
 
-def _move_files(files, sweep=False):
-    data_path = _get_data_path(files, sweep)
+def _move_files(files, sweep=False, data_path=None, filenames=None):
+    data_path = data_path if data_path is not None else _get_data_path(files, sweep)
     _ensure_target_path_exists(data_path)
     for file in files:
-        move(file, data_path / file)
+        move(_io_path(file), data_path / (filenames[file] if filenames else file))
 
 
 def _write_lab_log_if_configured(
         config, imagefiles, files, sweep=False, include_comments=True,
-        data_message=None):
+        data_message=None, data_path=None, obsidian_imagefiles=None):
     comment_text = data_message if data_message is not None else ''
     if config['keep_lab_log']:
         if include_comments and data_message is None:
             comment_text = input('Please enter a comment about this measurement: ')
         date = datetime.today().strftime('%Y-%m-%d')
-        measurement_type = files[0].split('_')[0]
-        if sweep:
-            measurement_type = files[0].split('_')[0] + '_sweeps'
-        folder_name = files[0].rstrip('.npy')
+        destination = data_path if data_path is not None else _get_data_path(files, sweep)
+        relative_folder = destination.relative_to('data').as_posix()
         with open(Path('data')/'LabLog'/ f'log_{date}.md', 'a',
                   encoding='utf-8') as file:
             file.write(
-                '## ' + files[0].rstrip(config['file_type'] + '\n\n'))
+                '## ' + Path(files[0]).stem)
             # file.write(data_message + '\n')
             for image in imagefiles:
-                file.write(f'![](../{measurement_type}/{folder_name}/{image})\n')
+                file.write(f'![](../{relative_folder}/{image})\n')
             file.write(
-                f'[config](../{measurement_type}/{folder_name}/{files[0].replace(config["file_type"], ".yaml")})\n')
+                f'[config](../{relative_folder}/{Path(files[0]).with_suffix(".yaml").name})\n')
             if comment_text:
                 file.write(comment_text + '\n')
 
@@ -507,7 +675,7 @@ def _write_lab_log_if_configured(
 
         with open(path_to_file / f'{date_file}.md', 'a', encoding='utf-8') as file:
             file.write('\n#### ' + files[0].rstrip(config['file_type'] + '\n'))
-            for image in imagefiles:
+            for image in (obsidian_imagefiles if obsidian_imagefiles is not None else imagefiles):
                 file.write(f'![[{image}]]\n')
             if comment_text:
                 file.write(comment_text + '\n')
@@ -527,15 +695,12 @@ def move_data(
     image_files = _get_images_if_configured(config)
     image_files = _filter_images_by_time_tag(image_files, files_to_move)
     _add_analysis_file(files_to_move)
-    _write_lab_log_if_configured(
-        config, image_files, files_to_move, include_comments=include_comments)
-    _move_files(files_to_move)
-    image_files = move_images(image_files, files_to_move[0], config)
+    _transfer_batch(files_to_move, image_files, config, include_comments=include_comments)
 
 
 def move_sweep(
         include_comments=True, experiment_type=None, sweep_param=None,
-        data_before=None, data_after=None, sweep_gap_factor=2):
+        data_before=None, data_after=None, sweep_gap_factor=5):
     """Select a sweep or timetrace variant and time range, then move related files."""
     config = get_manager_config()
     files_to_move = _get_sweep_files(
@@ -551,20 +716,18 @@ def move_sweep(
         data_before = selected_before
     if selected_after is not None:
         data_after = selected_after
+    # Folder names, image destinations, and lab-log links use the earliest dataset.
+    files_to_move.sort(key=lambda file: (
+        (_extract_file_timestamps(file) or [datetime.max])[0], file))
     _add_yaml_if_configured(config, files_to_move)
     _add_channel_companion_files(
         files_to_move, experiment_type, sweep_param,
         data_before=data_before, data_after=data_after, sweep_variant=sweep_variant)
     image_files = _get_images_if_configured(config)
-    image_files = _filter_images_by_time_tag(
-        image_files, files_to_move, sweep_variant=sweep_variant)
+    image_files = _filter_images_by_time_tag(image_files, files_to_move)
     shared_comment = None
     if config['keep_lab_log'] and include_comments:
         shared_comment = input('Please enter a comment about this measurement: ')
     #_add_analysis_file(files_to_move)
-    _write_lab_log_if_configured(
-        config, image_files, files_to_move, sweep=True,
-        include_comments=False, data_message=shared_comment)
-    _move_files(files_to_move, sweep=True)
-    image_files = move_images(
-        image_files, files_to_move[0], config, sweep=True)
+    _transfer_batch(files_to_move, image_files, config, sweep=True,
+                    include_comments=False, data_message=shared_comment)

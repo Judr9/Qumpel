@@ -77,6 +77,19 @@ identifiers such as `Ch1` in `AWG_Ch1_freq` are preserved. Different parameter
 combinations remain separate variants, and the timestamp-gap check below still
 applies to separate measurement sessions. This also works for `_timetrace_` files.
 
+Grids can contain two, three, or more parameters. Indexed parameter/value fragments
+are normalized too: `readout_phase0.07_readout_phase_20.07` and
+`readout_phase-0.07_readout_phase_2-0.07` belong to the same grid variant,
+`readout_phase_readout_phase`. The numeric-only index/value fragments are omitted
+from the grouping key, including signs and scientific notation. Parameter names
+and their order still define the grid; hardware channel identifiers such as
+`Ch1` remain distinct. Original parameter values remain in the measurement files.
+
+The destination folder is named after the earliest selected measurement, using
+its filename timestamp. Images and lab-log links use that same destination.
+Files sharing a timestamp are ordered by filename. Files without valid timestamps
+follow dated measurements; if all selected files are undated, filename order is used.
+
 If there are multiple variants, you choose one by entering its number:
 
 ```text
@@ -85,9 +98,9 @@ If there are multiple variants, you choose one by entering its number:
 ```
 
 For that variant, distinct timestamps are compared in chronological order.
-If a gap is more than twice the preceding gap, it suggests a potentially new
-sweep. For example, gaps of 60 seconds, 75 seconds, then 180 seconds split before
-the last dataset because 180 is greater than 2 times 75. A gap exactly twice
+If a gap is more than five times the preceding gap, it suggests a potentially new
+sweep. For example, gaps of 60 seconds, 75 seconds, then 400 seconds split before
+the last dataset because 400 is greater than 5 times 75. A gap exactly five times
 the previous gap stays in the same range. Files sharing a timestamp, such as
 channels of the same dataset, stay together and do not reset the comparison.
 At least three distinct timestamps are needed to compare two gaps; with fewer,
@@ -105,17 +118,21 @@ The manual format is `YYYY-MM-DD-HH-MM-SS - YYYY-MM-DD-HH-MM-SS`, for example
 `2026-10-07-16-12-45 - 2026-10-07-18-10-31`. These are inclusive `data_after`
 and `data_before` bounds applied to the already filtered variant. Invalid or
 empty ranges prompt you to try again before any files are moved.
-YAML files, channel companions, figures, and lab-log entries follow the selected
-variant and timestamps. Figures explicitly named for another sweep variant are
-excluded even if they share a timestamp; generic figures follow timestamp
-matching as before.
-Plot labels may repeat `sweep_`: for example,
-`CASR_sensitivity_sweep_sweep_N_2026-10-19-21-19-12_combined.png` also matches
-measurements grouped as `CASR_sensitivity_sweep_N` at that timestamp. Suffixes
-after the timestamp, including `_combined`, do not affect matching.
+YAML files, channel companions, and lab-log entries follow the selected variant
+and timestamps. Images are matched only by filename timestamp: every image in
+the configured `image_format` sharing any timestamp with a selected measurement
+is moved when `save_images` is enabled. The rest of the image filename, including
+experiment prefixes, parameter names, sweep/timetrace labels, and suffixes such
+as `_combined`, does not restrict matching.
+For example, `CASR_sensitivity_sweep_pi_2026-10-20-09-30-07_combined.png` follows
+`CASR_sensitivity_sweep_pi0.028_pi_half0.014_2026-10-20-09-30-07.npy` because
+their timestamps match. Images without a matching timestamp remain in place.
+This applies to both `move_data` and `move_sweep`, and checks every selected
+measurement's timestamp, including the oldest dataset, independently of the
+folder name.
 
 To adjust how large an increase suggests a new sweep, set `sweep_gap_factor`
-(a finite number greater than 1, default 2):
+(a finite number greater than 1, default 5):
 
 ```python
 move_sweep(sweep_gap_factor=3)
@@ -149,3 +166,47 @@ keeps its existing file selector; `move_sweep` uses the variant and time-range
 selectors described above. The `include_comments=False` keyword argument (or
 the `--no-comments` CLI option) skips the comment prompt while retaining any
 necessary file selection prompts.
+
+## Long filenames and Windows paths
+
+`move_data` and `move_sweep` check the entire batch's destination paths before
+moving measurements. This includes the sweep folder, measurement/YAML filenames,
+images with any configured filename prefix, and Obsidian image copies. Normal
+names are retained when they fit. The check uses conservative Windows limits:
+259 UTF-16 units for complete file paths, 247 for directories, and 255 for each
+path component. These accommodate the classic
+[Windows path-length limits](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
+
+If the original paths are too long, one naming style is applied to the whole batch:
+
+1. Abbreviate every sweep parameter to its initials while retaining its value.
+   For example, `readout_phase0.07_readout_phase_20.07` becomes
+   `rp0.07_rp_20.07`.
+2. If those paths still do not fit, retain only the first abbreviated sweep
+   parameter and its value, for example `rp0.07`. Later parameters are omitted
+   from destination filenames.
+
+Both stages preserve filename timestamps, channel tags such as `ch-2`, and file
+extensions. Individual timestamps identify grid points; no hashes are appended.
+NPY and YAML companions retain the same shortened stem. The sweep folder is shortened using
+the earliest selected measurement, and image destinations and lab-log links use
+the planned names. Generic image labels are abbreviated too when the batch needs
+shortening; image selection still uses only timestamps. Image labels following
+timestamps are retained as initials to distinguish plots sharing a timestamp.
+
+The destination folder contains `filename_map.json`, recording every original
+filename and its destination name, including images and Obsidian copies. Only
+destination names change; measurement and YAML contents are not rewritten.
+There are no additional prompts. One batch summary reports the naming style and
+mapping location, for example:
+
+```text
+Shortened this batch for Windows path limits (24 files, 2 images): parameter names -> initials (readout_phase -> rp); values retained.
+Timestamps, channels, and extensions retained.
+Original names and destinations: data/CASR_sweeps/.../filename_map.json
+```
+
+Existing destination files are never overwritten. If even the first-parameter
+style cannot fit, or destination names collide, the operation stops before
+moving any measurements. For a parent path that is still too long, move the
+measurement folder or configured Obsidian destination closer to the drive root.

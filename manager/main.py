@@ -39,7 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
         '--sweep-gap-factor',
         type=float,
         help='suggest separate sweep time ranges when a timestamp gap exceeds '
-             'this factor times the preceding gap (default: 2; movesweep only)',
+             'this factor times the preceding gap (default: 5; movesweep only)',
     )
     return parser
 
@@ -75,7 +75,7 @@ def main(argv=None):
                 data_before=args.data_before,
                 data_after=args.data_after,
                 sweep_gap_factor=(args.sweep_gap_factor
-                                  if args.sweep_gap_factor is not None else 2))
+                                  if args.sweep_gap_factor is not None else 5))
         case 'new_meta':
             new_metadata_package()
         case 'update_meta':
